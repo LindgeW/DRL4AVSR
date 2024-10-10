@@ -141,8 +141,7 @@ class GRIDDataset(Dataset):
             self.dataset = data
         print(len(self.dataset))
         self.phase = phase
-        self.vocab = [PAD] + [' ', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
-                                  'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']    # 28
+        self.vocab = [PAD] + list(' ' + string.ascii_uppercase)    # 28
         self.max_vid_len = 75
         self.max_txt_len = 50
 
@@ -208,7 +207,7 @@ class Speaker(object):
     def __init__(self, data):
         # GRID\LIP_160x80\lip\s1\bbaf4p
         self.data = data
-        self.vocab = [PAD] + [' ', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']   # 28
+        self.vocab = [PAD] + list(' ' + string.ascii_uppercase)   # 28
         self.max_vid_len = 75
         self.max_txt_len = 50
 
@@ -352,7 +351,7 @@ class GRIDDataset(Dataset):
         self.sample_size = sample_size  # 每个speaker采的样本数
         self.root_path = root_path
         self.phase = phase
-        #self.vocab = [PAD] + [' ', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']  # 28
+        #self.vocab = [PAD] + list(' ' + string.ascii_uppercase)  # 28
         with open('word_vocab.txt', 'r', encoding='utf-8') as fin:
             vocab = [line.strip() for line in fin if line.strip() != '']
         #self.vocab = [PAD] + vocab  # 52
