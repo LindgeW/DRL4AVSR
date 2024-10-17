@@ -149,7 +149,7 @@ class TransDecoder(nn.Module):
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
         self.fc = nn.Linear(d_model, n_token-1)  # excluding bos
 
-    def get_mask_from_lens(self, lengths, max_len=None):
+    def get_padding_mask_from_lens(self, lengths, max_len=None):
         '''
          param:   lengths --- [Batch_size]
          return:  mask --- [Batch_size, max_len]
@@ -157,8 +157,8 @@ class TransDecoder(nn.Module):
         batch_size = lengths.shape[0]
         if max_len is None:
             max_len = torch.max(lengths).item()
-        ids = torch.arange(0, max_len).unsqueeze(0).expand(batch_size, -1).to(lengths.device)
-        mask = ids < lengths.unsqueeze(1).expand(-1, max_len)  # True or False
+        ids = torch.arange(max_len).unsqueeze(0).expand(batch_size, -1).to(lengths.device)
+        mask = ids >= lengths.unsqueeze(1).expand(-1, max_len)  # True for padding
         return mask
 
     def generate_mask_from_lens(self, seq_lengths, max_length=None):
@@ -185,8 +185,8 @@ class TransDecoder(nn.Module):
         tgt = self.tok_embedding(tgt) * (self.d_model ** 0.5)
         tgt = self.pos_enc(tgt)
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt.size(1)).to(tgt.device)   # 下三角 (下0上-inf)
-        src_padding_mask = ~self.get_mask_from_lens(src_lens, src_enc.size(1))   # True for masking
-        tgt_padding_mask = ~self.get_mask_from_lens(tgt_lens, tgt.size(1))   # True for masking
+        src_padding_mask = self.get_padding_mask_from_lens(src_lens, src_enc.size(1))   # True for masking
+        tgt_padding_mask = self.get_padding_mask_from_lens(tgt_lens, tgt.size(1))   # True for masking
         #src_padding_mask = self.generate_mask_from_lens(src_lens, src_enc.size(1))   # float("-inf") for masking
         #tgt_padding_mask = self.generate_mask_from_lens(tgt_lens, tgt.size(1))   # float("-inf") for masking
 
