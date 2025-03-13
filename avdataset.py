@@ -9,6 +9,7 @@ from data_augment import *
 from torch.nn.utils.rnn import pad_sequence
 
 PAD = '<pad>'
+SPACE = ' '
 BOS = '<bos>'
 EOS = '<eos>'
 
@@ -628,6 +629,228 @@ class CMLRDataset(Dataset):
         vid_path = os.path.join(self.root_path, 'video', data_path)
         txt_path = os.path.join(self.root_path, 'text', data_path+'.txt')
         aud_path = os.path.join(self.root_path, 'audio', data_path+'.wav')
+        # vid, aud, txt, vid_len, aud_len, txt_len = self.fetch_data(vid_path, aud_path, txt_path)
+        vid, aud, txt = self.fetch_data(vid_path, aud_path, txt_path)
+        return dict(vid=torch.FloatTensor(vid),  # (T, C, H, W)
+                    aud=torch.FloatTensor(aud),  # (T, D)
+                    txt=torch.LongTensor(txt),   # (L, )
+                    spk_id=spk_id,
+                    # vid_lens=torch.tensor(vid_len),
+                    # aud_lens=torch.tensor(aud_len),
+                    # txt_lens=torch.tensor(txt_len)
+                    )
+
+    def __getitem__(self, idx):
+        return self.get_one_data(idx)
+
+    def __len__(self):
+        return len(self.data)
+
+    # 按照batch中最长序列的长度进行padding，返回对齐后的序列和实际序列长度
+    @classmethod
+    def collate_pad(cls, batch):
+        padded_batch = {}
+        for data_type in batch[0].keys():
+            if data_type == 'spk_id':
+                padded_batch[data_type] = torch.tensor([s[data_type] for s in batch])
+            else:
+                if data_type == 'vid':
+                    max_len = cls.MAX_VID_LEN
+                elif data_type == 'aud':
+                    max_len = cls.MAX_AUD_LEN
+                elif data_type == 'txt':
+                    max_len = None
+                else:
+                    max_len = None
+                pad_vid, ret_lens = pad_seqs3([s[data_type] for s in batch if s[data_type] is not None], max_len)
+                padded_batch[data_type] = pad_vid
+                if data_type == 'txt':
+                    padded_batch[data_type+'_lens'] = torch.tensor(ret_lens) - 2  # excluding bos and eos
+                else:
+                    padded_batch[data_type+'_lens'] = torch.tensor(ret_lens)
+        return padded_batch
+
+    # @classmethod
+    # def collate_pad(cls, batch):
+    #     return torch.utils.data.dataloader.default_collate(batch)
+
+
+def pad_seqs(samples, max_len=None, pad_val=0.):
+    if max_len is None:
+        lens = [len(s) for s in samples]
+    else:
+        lens = [min(len(s), max_len) for s in samples]
+    max_len = max(lens)
+    padded_batch = samples[0].new_full((len(samples), max_len, ) + samples[0].shape[1:], pad_val)
+    for i, s in enumerate(samples):
+        if len(s) < max_len:
+            padded_batch[i][:len(s)] = s
+        else:
+            padded_batch[i] = s[:max_len]
+    return padded_batch, lens
+
+
+def pad_seqs2(samples, max_len=None, pad_val=0.):
+    if max_len is None:
+        lens = [len(s) for s in samples]
+    else:
+        lens = [min(len(s), max_len) for s in samples]
+    max_len = max(lens)
+    padded_batch = []
+    for seq in samples:
+        if len(seq) < max_len:
+            padding = seq.new_full((max_len-len(seq), ) + seq.shape[1:], pad_val)
+            padded_seq = torch.cat((seq, padding), dim=0)
+        else:
+            padded_seq = seq[:max_len]
+        padded_batch.append(padded_seq)
+    return torch.stack(padded_batch), lens
+
+
+def pad_seqs3(samples, max_len=None, pad_val=0.):
+    if max_len is None:
+        lens = [len(s) for s in samples]
+    else:
+        lens = [min(len(s), max_len) for s in samples]
+    max_len = max(lens)
+    padded_batch = pad_sequence(samples, batch_first=True, padding_value=pad_val)  # (B, L_max, ...)
+    return padded_batch[:, :min(max_len, padded_batch.shape[1])], lens
+
+
+
+
+class LRS3Dataset(Dataset):   # 说话人数量多 
+    # 类变量
+    MAX_VID_LEN = 155
+    MAX_AUD_LEN = 620
+    #MAX_AUD_LEN = 155   # avhubert
+    MAX_TXT_LEN = 150
+
+    def __init__(self, root_path, file_list, phase='train', setting='unseen', max_frame=None):
+        self.root_path = root_path
+        self.phase = phase
+        self.data = []
+        self.spks = list(range(4004))
+        with open(file_list, 'r', encoding='utf-8') as f:
+            for line in f:  # 1 test/stngBN4hp14/00001.npy 120
+                spk_id, fn, frame_num = line.strip().split(' ')
+                if max_frame is None or int(frame_num) <= max_frame:
+                	self.data.append((int(spk_id), fn))
+        self.vocab = [PAD] + list(" " + string.ascii_lowercase + string.digits + "'") + [EOS, BOS]
+        print(len(self.data), len(self.spks), len(self.vocab))
+
+        self.noise_generator = NoiseDataset(noise_path='../NoiseDataset/NoiseX-92/pink.wav')
+        # self.noise_generator = NoiseDataset(noise_path='../NoiseDataset/NoiseX-92/babble.wav')
+        # self.noise_generator = NoiseDataset(noise_path='../NoiseDataset/NoiseX-92/white.wav')
+
+    def load_video(self, fn):
+        vid = np.load(fn)   # (T, H, W)
+        array = vid[:, None].astype(np.float32)  # TCHW  C=1
+        return array / 255.
+
+    def load_audio(self, fn, sr=16000):
+        def stacker(feats, stack_order=4, trunct=False):
+            """
+            Concatenating consecutive audio frames
+            Args:
+                feats - numpy.ndarray of shape [T, F]
+                stack_order - int (number of neighboring frames to concatenate
+            Returns:
+                feats - numpy.ndarray of shape [T', F']  = [T/stack_order, F*stack_order]
+            """
+            feat_dim = feats.shape[1]
+            if trunct:
+                return feats[:stack_order*(feats.shape[0]//stack_order)].reshape((-1, stack_order*feat_dim))
+            if len(feats) % stack_order != 0:
+                res = stack_order - len(feats) % stack_order
+                res = np.zeros([res, feat_dim]).astype(feats.dtype)
+                feats = np.concatenate([feats, res], axis=0)
+            feats = feats.reshape((-1, stack_order, feat_dim)).reshape(-1, stack_order*feat_dim)
+            return feats
+
+        # y, sr = librosa.load(fn, sr=sr)  # 16kHz
+        y, sr0 = librosa.load(fn, sr=None)
+        if sr0 != sr:
+            y = librosa.resample(y, orig_sr=sr0, target_sr=sr)
+
+        # 以0.25的概率随机叠加噪声波形
+        if self.phase == 'train' and np.random.rand() < 0.25:
+            y = self.noise_generator.training_noisy_signal(y)
+        else:
+            y = normalize(y)
+            # y = self.noise_generator.testing_noisy_signal(y, 5)  # 5dB
+
+        #melspec = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=512, win_length=320, hop_length=160, n_mels=80)  # 20ms win / 10ms hop for lrs3
+        #melspec = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=512, win_length=400, hop_length=160, n_mels=80)  # 25ms win / 10ms hop for lrs3
+        #melspec = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=640, hop_length=160, n_mels=80)  # 40ms win / 10ms hop for lrs3
+        melspec = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=512, win_length=400, hop_length=160, n_mels=80)  # 25ms win / 10ms hop for lrs3
+        #melspec = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=512, win_length=400, hop_length=160, n_mels=26)  # 25ms win / 10ms hop for avhubert
+        logmelspec = librosa.power_to_db(melspec, ref=np.max)
+        #return logmelspec.T  # (T, n_mels)
+        log_mel = logmelspec.T   # (T, n_mels)
+        #log_mel = stacker(log_mel, 4)  # only for avhubert: 26 * 4
+        norm_log_mel = np.nan_to_num((log_mel - log_mel.mean(0, keepdims=True)) / (log_mel.std(0, keepdims=True)+1e-8))  # z-norm along time
+        return norm_log_mel
+
+    def load_txt(self, fn):
+        with open(fn, 'r', encoding='utf-8') as f:
+            txt = f.readline().strip()   # 读第一行
+        txt = txt.replace("Text:", "").replace("{LG}", "").replace("{NS}", "").strip().lower()
+        #return np.asarray([self.vocab.index(w) for w in txt])
+        # return np.asarray([self.vocab.index(BOS)] + [self.vocab.index(w) for w in txt] + [self.vocab.index(EOS)])
+        return np.asarray(list(map(self.vocab.index, [BOS]+list(txt)+[EOS])))
+
+    def data_augment(self, vid, aud):
+        if self.phase == 'train':
+            vid = vid_rand_crop(vid, 88, 88)
+            if np.random.rand() < 0.5:
+                vid = horizontal_flip(vid)
+                #aud = spec_augment(aud, time_first=True)
+        else:
+            vid = vid_center_crop(vid, 88, 88)
+        return vid, aud
+
+    def padding(self, array, max_len):
+        if len(array) >= max_len:
+            return array[:max_len]
+        return np.concatenate([array, np.zeros([max_len - len(array)] + list(array[0].shape), dtype=array[0].dtype)])
+
+    # def fetch_data(self, vid_path, aud_path, align_path):
+    #     vid = self.load_video(vid_path)
+    #     aud = self.load_audio(aud_path)
+    #     txt = self.load_txt(align_path)
+    #     # data augmentation
+    #     vid, aud = self.data_augment(vid, aud)
+    #     #print(vid.shape, aud.shape, len(txt), flush=True)
+    #     vid_len = min(len(vid), self.MAX_VID_LEN)
+    #     aud_len = min(len(aud), self.MAX_AUD_LEN)
+    #     txt_len = min(len(txt), self.MAX_TXT_LEN) - 2  # excluding bos and eos
+    #     vid = self.padding(vid, self.MAX_VID_LEN)
+    #     aud = self.padding(aud, self.MAX_AUD_LEN)
+    #     txt = self.padding(txt, self.MAX_TXT_LEN)
+    #     return vid, aud, txt, vid_len, aud_len, txt_len
+
+    def fetch_data(self, vid_path, aud_path, align_path):
+        vid = self.load_video(vid_path)
+        aud = self.load_audio(aud_path)
+        # 对齐帧长
+        #diff = len(aud) - len(vid)
+        #if diff < 0:
+        #    aud = np.concatenate([aud, np.zeros((-diff, aud.shape[-1]), dtype=aud.dtype)])
+        #elif diff > 0:
+        #    aud = aud[:-diff]
+
+        txt = self.load_txt(align_path)
+        # data augmentation
+        vid, aud = self.data_augment(vid, aud)
+        # print(vid.shape, aud.shape, len(txt), flush=True)
+        return vid, aud, txt
+
+    def get_one_data(self, idx):
+        spk_id, data_path = self.data[idx]
+        vid_path = os.path.join(self.root_path, data_path)
+        aud_path = os.path.join(self.root_path, data_path.replace('.npy', '.wav'))
+        txt_path = os.path.join(self.root_path, data_path.replace('.npy', '.txt'))
         # vid, aud, txt, vid_len, aud_len, txt_len = self.fetch_data(vid_path, aud_path, txt_path)
         vid, aud, txt = self.fetch_data(vid_path, aud_path, txt_path)
         return dict(vid=torch.FloatTensor(vid),  # (T, C, H, W)
