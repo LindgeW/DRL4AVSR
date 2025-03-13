@@ -6,6 +6,51 @@ def horizontal_flip(video_imgs):
     return np.flip(video_imgs, -1).copy()
 
 
+def vid_rand_crop(vid, crop_height, crop_width):
+    """
+    对输入视频帧序列进行随机裁剪。
+    参数:
+        vid (numpy.ndarray): 形状为:
+              (T, H, W) 或 (T, H, W, C)。
+              (T, H, W) 或 (T, C, H, W)。
+        crop_height (int): 裁剪的高度。
+        crop_width (int): 裁剪的宽度。
+    返回:
+        numpy.ndarray: 随机裁剪后的序列。
+    """
+    #height, width = vid.shape[1], vid.shape[2]
+    height, width = vid.shape[2], vid.shape[3]
+    if height < crop_height or width < crop_width:
+        raise ValueError("裁剪尺寸不能大于原图尺寸!")
+    x = np.random.randint(0, width - crop_width)
+    y = np.random.randint(0, height - crop_height)
+    #return vid[:, y:y + crop_height, x:x + crop_width]
+    return vid[..., y:y + crop_height, x:x + crop_width]
+
+
+def vid_center_crop(vid, crop_height, crop_width):
+    """
+    对输入视频帧序列进行随机裁剪。
+    参数:
+        vid (numpy.ndarray): 形状为:
+              (T, H, W) 或 (T, H, W, C)。
+              (T, H, W) 或 (T, C, H, W)。
+        crop_height (int): 裁剪的高度。
+        crop_width (int): 裁剪的宽度。
+    返回:
+        numpy.ndarray: 随机裁剪后的序列。
+    """
+    #height, width = vid.shape[1], vid.shape[2]
+    height, width = vid.shape[2], vid.shape[3]
+    if height < crop_height or width < crop_width:
+        raise ValueError("裁剪尺寸不能大于原图尺寸!")
+    x = (width - crop_width) // 2
+    y = (height - crop_height) // 2
+    #return vid[:, y:y + crop_height, x:x + crop_width]
+    return vid[..., y:y + crop_height, x:x + crop_width]
+
+
+
 def spec_augment(mel_spec, freq_masking_para=5, time_masking_para=30, freq_mask_num=1, time_mask_num=1, time_first=False):
     """Spec augmentation Calculation Function.
     'specAugment' have 3 steps for audio data augmentation.
