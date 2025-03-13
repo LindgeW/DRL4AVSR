@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from avdataset import GRIDDataset, CMLRDataset, BucketBatchSampler
+from avdataset import GRIDDataset, CMLRDataset, LRS3Dataset, BucketBatchSampler
 import torch.optim as optim
 from avmodel import CTCLipModel, DRLModel
 from jiwer import cer, wer
@@ -88,6 +88,7 @@ def avtrain(train_set, val_set=None, lr=3e-4, epochs=100, batch_size=32, model_p
 
     # data_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=False)  # GRID
     data_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=False, collate_fn=CMLRDataset.collate_pad)  # CMLR
+    # data_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False, collate_fn=LRS3Dataset.collate_pad)  # LRS3
     # bucket_sampler = BucketBatchSampler(train_set, batch_size=batch_size, bucket_boundaries=[50, 100, 150, 200])
     # data_loader = DataLoader(train_set, batch_sampler=bucket_sampler, num_workers=4, pin_memory=False, collate_fn=CMLRDataset.collate_pad)
 
@@ -311,6 +312,7 @@ def evaluate(model_path, dataset, batch_size=32):
     print(len(dataset))
     # data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
     data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=CMLRDataset.collate_pad)
+    # data_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False, collate_fn=LRS3Dataset.collate_pad)  # LRS3
     preds = []
     refs = []
     PAD_ID, BOS_ID, EOS_ID = (dataset.vocab.index(x) for x in [PAD, BOS, EOS])
@@ -321,24 +323,21 @@ def evaluate(model_path, dataset, batch_size=32):
         vid_lens = batch_data['vid_lens'].to(DEVICE)
         aud_lens = batch_data['aud_lens'].to(DEVICE)
         #output = model.greedy_decode(vid_inp, input_lens)
-        output = model.beam_decode(vid_inp, aud_inp, vid_lens, aud_lens, bos_id=BOS_ID, eos_id=EOS_ID, max_dec_len=40)
-        pred = []
-        ref = []
+        output = model.beam_decode(vid_inp, aud_inp, vid_lens, aud_lens, bos_id=BOS_ID, eos_id=EOS_ID, max_dec_len=50)
         for out, tgt in zip(output, tgt_txt):
             ## CER
-            #pred.append(''.join([dataset.vocab[i] for i in torch.unique_consecutive(out).tolist() if i not in [PAD_ID, BOS_ID, EOS_ID]]))
-            #ref.append(''.join([dataset.vocab[i] for i in tgt.tolist() if i not in [PAD_ID, BOS_ID, EOS_ID]]))
+            #preds.append(''.join([dataset.vocab[i] for i in torch.unique_consecutive(out).tolist() if i not in [PAD_ID, BOS_ID, EOS_ID]]))
+            #refs.append(''.join([dataset.vocab[i] for i in tgt.tolist() if i not in [PAD_ID, BOS_ID, EOS_ID]]))
             ## WER
-            #pred.append(' '.join([dataset.vocab[i] for i in torch.unique_consecutive(out).tolist() if i not in [PAD_ID, BOS_ID, EOS_ID]]))
-            pred.append(' '.join([dataset.vocab[i] for i in out.tolist() if i not in [PAD_ID, BOS_ID, EOS_ID]]))
-            ref.append(' '.join([dataset.vocab[i] for i in tgt.tolist() if i not in [PAD_ID, BOS_ID, EOS_ID]]))
+            #preds.append(' '.join([dataset.vocab[i] for i in torch.unique_consecutive(out).tolist() if i not in [PAD_ID, BOS_ID, EOS_ID]]))
+            preds.append(' '.join([dataset.vocab[i] for i in out.tolist() if i not in [PAD_ID, BOS_ID, EOS_ID]]))
+            refs.append(' '.join([dataset.vocab[i] for i in tgt.tolist() if i not in [PAD_ID, BOS_ID, EOS_ID]]))
             # write_to('pred-cmlr.txt', ref[-1]+'\t'+pred[-1]+'\t'+str(ref[-1] == pred[-1]))
-        #print(pred, gold)
-        preds.extend(pred)
-        refs.extend(ref)
+
     test_wer, test_cer = wer(refs, preds), cer(refs, preds)
     print('JIWER wer: {:.4f}, cer: {:.4f}'.format(test_wer, test_cer))
     return test_wer, test_cer
+
 
 
 if __name__ == '__main__':
@@ -390,5 +389,17 @@ if __name__ == '__main__':
         ## 测试
         test_set = CMLRDataset(data_root, r'data\unseen_test.csv', phase='test', setting='unseen')
         evaluate('checkpoints/avsr_unseen_cmlr/iter_40.pt', test_set, batch_size=32)
+    elif data_type == 'lrs3':
+        data_root = r'../LipData/LRS3'
+        train_set = LRS3Dataset(data_root, r'../LipData/LRS3/trainval_id.txt', phase='train', setting='unseen')
+        val_set = LRS3Dataset(data_root, r'../LipData/LRS3/test_id.txt', phase='test', setting='unseen')
+        avtrain(train_set, val_set, lr=4e-4, epochs=50, batch_size=16, model_path='lrw.pt')
+        #cl_avtrain(lr=4e-4, epochs=60, batch_size=16, model_path=None)
+        ## 测试
+        #test_set = LRS3Dataset(data_root, r'../LipData/LRS3/test_id.txt', phase='test', setting='unseen')
+        #evaluate('checkpoints/avsr_unseen_lrs3/iter_50.pt', test_set, batch_size=32)
+        #evaluate('checkpoints/v2a_avsr_unseen_lrs3/iter_35.pt', test_set, batch_size=32)
+        #evaluate('vanilla_model_avg_10.pt', test_set, batch_size=32)
+        #evaluate_gpt('vanilla_model_avg_10.pt', test_set, batch_size=32)  
     else:
         raise NotImplementedError('Invalid Dataset!')
