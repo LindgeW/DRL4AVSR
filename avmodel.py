@@ -5,13 +5,24 @@ import torch.nn.functional as F
 from ctc_decode import *
 from multiprocessing import Pool
 from conformer import Conformer
-from transformer import TransformerEncoder
 import random
 from batch_beam_search import beam_decode
 from club import *
-from fusion_method import *
-from dist_loss import *
-from file_io import write_numpy_to
+
+
+
+def diff_loss(x1, x2):  # (B, D1)  (B, D2)
+    if x1.ndim == 3 and x2.ndim == 3:
+        x1 = torch.flatten(x1, 0, 1)
+        x2 = torch.flatten(x2, 0, 1)
+    nx1 = F.normalize(x1 - torch.mean(x1, 0), dim=-1)
+    nx2 = F.normalize(x2 - torch.mean(x2, 0), dim=-1)
+    #nx1 = F.normalize(x1, dim=-1)
+    #nx2 = F.normalize(x2, dim=-1)
+    return torch.mean(F.relu(1. - torch.norm(nx1-nx2, p=2, dim=-1)) ** 2)
+    #return torch.mean(torch.matmul(nx1.transpose(-1, -2), nx2).pow(2))  # C x C   效果差！
+    #return torch.mean(torch.abs(F.cosine_similarity(x1-torch.mean(x1, 0), x2-torch.mean(x2, 0), dim=-1)))  # 效果较差
+
 
 
 def conv3x3(in_planes, out_planes, stride=1):
@@ -28,7 +39,7 @@ class BasicBlock(nn.Module):
         super(BasicBlock, self).__init__()
         self.conv1 = conv3x3(inplanes, planes, stride)
         self.bn1 = nn.BatchNorm2d(planes)
-        self.relu = nn.ReLU()
+        self.relu = nn.ReLU(inplace=True)
         self.conv2 = conv3x3(planes, planes)
         self.bn2 = nn.BatchNorm2d(planes)
         self.downsample = downsample
@@ -63,7 +74,7 @@ class BasicBlock(nn.Module):
         return out
 
 
-# ResNet18 / ResNet34
+# ResNet18
 class ResNet(nn.Module):
     def __init__(self, block, layers, se=False):
         self.inplanes = 64
@@ -86,6 +97,7 @@ class ResNet(nn.Module):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
         
+
     def _make_layer(self, block, planes, blocks, stride=1):
         downsample = None
         if stride != 1 or self.inplanes != planes * block.expansion:
@@ -113,12 +125,13 @@ class ResNet(nn.Module):
         return x
 
 
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=200, dropout=0.1):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(dropout)
         position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)  # (max_len, 1)
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * -(math.log(10000.0) / d_model))
         pe = torch.zeros(max_len, d_model)  # (max_len, d_model)
         pe[:, 0::2] = torch.sin(position * div_term)  # PE(pos, 2i)
         pe[:, 1::2] = torch.cos(position * div_term)  # PE(pos, 2i+1)
@@ -150,7 +163,7 @@ class TransDecoder(nn.Module):
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
         self.fc = nn.Linear(d_model, n_token-1)  # excluding bos
 
-    def get_padding_mask_from_lens(self, lengths, max_len=None):
+    def get_mask_from_lens(self, lengths, max_len=None):
         '''
          param:   lengths --- [Batch_size]
          return:  mask --- [Batch_size, max_len]
@@ -158,47 +171,27 @@ class TransDecoder(nn.Module):
         batch_size = lengths.shape[0]
         if max_len is None:
             max_len = torch.max(lengths).item()
-        ids = torch.arange(max_len).unsqueeze(0).expand(batch_size, -1).to(lengths.device)
-        mask = ids >= lengths.unsqueeze(1).expand(-1, max_len)  # True for padding
-        return mask
-
-    def generate_mask_from_lens(self, seq_lengths, max_length=None):
-        """
-        根据给定的序列长度生成掩码矩阵。
-        Args:
-            seq_lengths (torch.Tensor): 每个序列的长度，形状为 (batch_size,)。
-            max_length (int): 序列的最大长度。
-        Returns:
-            torch.Tensor: 掩码矩阵，形状为 (batch_size, max_length)，其中填充部分为 -inf，有效部分为 0。
-        """
-        if max_length is None:
-            max_length = seq_lengths.max().item()
-        B = seq_lengths.size(0)
-        range_tensor = torch.arange(max_length, device=seq_lengths.device).expand(B, max_length)
-        mask = range_tensor < seq_lengths.unsqueeze(1)
-        mask = torch.where(mask, 0.0, float('-inf'))
-        # mask = mask.float()
-        # mask[mask == 0] = float('-inf')
-        # mask[mask == 1] = 0.0
+        ids = torch.arange(0, max_len).unsqueeze(0).expand(batch_size, -1).to(lengths.device)
+        mask = ids < lengths.unsqueeze(1).expand(-1, max_len)  # True or False
         return mask
 
     def forward(self, tgt, src_enc, src_lens=None, tgt_lens=None):
         tgt = self.tok_embedding(tgt) * (self.d_model ** 0.5)
         tgt = self.pos_enc(tgt)
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt.size(1)).to(tgt.device)   # 下三角 (下0上-inf)
-        # src_padding_mask = self.get_padding_mask_from_lens(src_lens, src_enc.size(1))   # True for masking
-        # tgt_padding_mask = self.get_padding_mask_from_lens(tgt_lens, tgt.size(1))   # True for masking
-        src_padding_mask = self.generate_mask_from_lens(src_lens, src_enc.size(1))   # float("-inf") for masking
-        tgt_padding_mask = self.generate_mask_from_lens(tgt_lens, tgt.size(1))   # float("-inf") for masking
-
+        src_padding_mask = ~self.get_mask_from_lens(src_lens, src_enc.size(1))   # True for masking
+        tgt_padding_mask = ~self.get_mask_from_lens(tgt_lens, tgt.size(1))   # True for masking
         dec_out = self.decoder(tgt, src_enc, tgt_mask,
                                tgt_key_padding_mask=tgt_padding_mask,
                                memory_key_padding_mask=src_padding_mask)
         return self.fc(dec_out)
 
 
+
+
+
 class CTCLipModel(nn.Module):
-    def __init__(self, vocab_size, num_spk, se=False):
+    def __init__(self, vocab_size, se=False):
         super(CTCLipModel, self).__init__()
         # shallow 3DCNN
         self.frontend3D = nn.Sequential(
@@ -209,20 +202,18 @@ class CTCLipModel(nn.Module):
         )
         # resnet18
         self.resnet18 = ResNet(BasicBlock, [2, 2, 2, 2], se=se)
-        # resnet34
-        #self.resnet34 = ResNet(BasicBlock, [3, 4, 6, 3], se=se)
 
         self.afront = nn.Sequential(
             nn.Conv1d(80, 128, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm1d(128),
-            nn.ReLU(True),
-            #nn.GELU(),
-            nn.Dropout(0.1),
+            #nn.ReLU(True),
+            nn.GELU(),
+            #nn.SiLU(),
             nn.Conv1d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),   # downsampling
             nn.BatchNorm1d(256),
-            nn.ReLU(True),
-            #nn.GELU(),
-            nn.Dropout(0.1),
+            #nn.ReLU(True),
+            nn.GELU(),
+            #nn.SiLU(),
             nn.Conv1d(256, 512, kernel_size=3, stride=2, padding=1, bias=False),   # downsampling
             nn.BatchNorm1d(512))
         self.scale = 4
@@ -230,69 +221,22 @@ class CTCLipModel(nn.Module):
         self.vm_embed = nn.Parameter(torch.zeros(512))
        
         self.av_mlp = nn.Sequential(
-            nn.LayerNorm(512),
             nn.Linear(512, 512*2),
+            #Transpose(1, 2),
+            #nn.BatchNorm1d(512*2),
+            #Transpose(1, 2),
             nn.ReLU(True),
-            nn.Dropout(0.1),
             nn.Linear(512*2, 512))
-        self.ln = nn.LayerNorm(512)
 
-        #self.av_mlp2 = nn.Sequential(
-        #    nn.LayerNorm(512),
-        #    nn.Linear(512, 512*2),
-        #    nn.ReLU(True),
-        #    #nn.GELU(),
-        #    nn.Linear(512*2, 512))
-
-        #self.mha_av = nn.MultiheadAttention(embed_dim=512, num_heads=4, dropout=0.1, batch_first=True)
-        #self.mha_va = nn.MultiheadAttention(embed_dim=512, num_heads=4, dropout=0.1, batch_first=True)
-        self.av_trans = TransformerEncoder(512, 4, 3, 0.1)
-
-        #self.spk_enc = nn.Sequential(
-        #    nn.Conv1d(512, 256, kernel_size=3, stride=1, padding=1, bias=False),   
-        #    nn.BatchNorm1d(256),
-        #    nn.ReLU(True),
-        #    nn.Dropout(0.1),
-        #    nn.Conv1d(256, 256, kernel_size=1, stride=1, padding=0, bias=False),   
-        #    nn.BatchNorm1d(256),
-        #    nn.ReLU(True),)
-
-        self.spk_vid = nn.Sequential(  # temporal pooling
+        self.spk_id = nn.Sequential(
             nn.Linear(512*2, 512),
-            #nn.ReLU(True),
-            #nn.BatchNorm1d(512),
-            #nn.Dropout(0.1),
-            #nn.Linear(512, 512),
-            #nn.BatchNorm1d(512),
-            nn.LayerNorm(512),
-            )
-        self.spk_aid = nn.Sequential(  # stats pooling / attention pooling
-            nn.Linear(512*2, 512),
-            #nn.ReLU(True),
-            #nn.BatchNorm1d(512),
-            #nn.Dropout(0.1),
-            #nn.Linear(512, 512),
-            #nn.BatchNorm1d(512),
-            nn.LayerNorm(512),
-            )
-        self.spk_cls = nn.Linear(512, num_spk)
-
-        #self.sp_disc = nn.Linear(512, 3)  # shared-private collaborative discriminator
+            nn.ReLU(True),
+            nn.BatchNorm1d(512))
+        self.spk_cls = nn.Linear(512, 29)
 
         # backend: gru/tcn/transformer
         #self.gru = nn.GRU(512, 256, num_layers=3, bidirectional=True, batch_first=True, dropout=0.5)
-        self.cfm_a = Conformer(512, 4, 512*4, 3, 31, 0.1)
-        self.cfm_v = Conformer(512, 4, 512*4, 3, 31, 0.1)
-        self.cfm_c = Conformer(512, 4, 512*4, 3, 31, 0.1)
-
-        self.recon_v = nn.Linear(512*2, 512)
-        self.recon_a = nn.Linear(512*2, 512)
-
-        #self.factor = nn.Parameter(torch.zeros(1))  
-        #self.q = nn.Parameter(torch.empty(1, 8, 512).normal_(std=0.02))
-        #self.autofusion = AutoFusion(512, 512*2)
-        #self.cmd_loss = CMD()
-        
+        self.cfm = Conformer(512, 4, 512*4, 3, 31, 0.1)
         # fc
         self.fc = nn.Linear(512, vocab_size-1)  # including blank label, excluding bos
 
@@ -308,7 +252,6 @@ class CTCLipModel(nn.Module):
         x = x.transpose(1, 2).contiguous()
         x = x.reshape(-1, 64, x.size(3), x.size(4))
         x = self.resnet18(x)
-        #x = self.resnet34(x)
         return x.reshape(bs, -1, 512)
     
     def audio_frontend(self, x):  # (b, t, c)
@@ -317,125 +260,59 @@ class CTCLipModel(nn.Module):
         x = x.transpose(1, 2).contiguous()
         return x
 
-    def attention(self, q, k, v):
-        s = (q @ k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
-        attn = F.softmax(s, dim=-1) @ v
-        return attn
-
-    def av_fusion(self, a, v, av_mlp=None):  # (B, Ta, D)  (B, Tv, D)
-        #va = v + self.attention(v, a, a) 
-        #av = a + self.attention(a, v, v)  
-        av = a + self.mha_av(a, v, v)[0]
-        #out = av + av_mlp(av)
-        out = self.ln(av + av_mlp(av))
-        return out
-
-    def av_fusion_memory(self, a, v, av_mlp=None):  # (B, Ta, D)  (B, Tv, D)
-        vq = self.attention(self.q, v, v)     # V -->> q
-        av = a + self.factor * self.attention(a, vq, vq)    # q -->> A
-        #concat_ = torch.cat((a, v), dim=1)
-        #avq = self.attention(self.q, concat_, concat_)    # AV -->> q
-        #av = a + self.attention(a, avq, avq)    # q -->> AV
-        #va = v + self.attention(v, avq, avq)    # q -->> VA
-        out = self.ln(av + av_mlp(av))
+    def av_fusion(self, a, v):  # (B, Ta, D)  (B, Tv, D)
+        av = F.softmax((a @ v.transpose(-1, -2))/(a.size(-1)**0.5), dim=-1) @ v + a
+        #va = F.softmax((v @ a.transpose(-1, -2))/(v.size(-1)**0.5), dim=-1) @ a + v
+        out = av + self.av_mlp(av)
         return out
 
     def forward(self, vid, aud, tgt, vid_lens=None, aud_lens=None, tgt_lens=None):  # (b, t, c, h, w)
-        src_lens = aud_lens
-        #src_lens = vid_lens
+        b, t = vid.size()[:2]
+        src_lens = aud_lens // self.scale   # time downsampling
         vid = self.visual_frontend(vid)
         aud = self.audio_frontend(aud)
+        #vid_id = self.spk_id(torch.cat((vid.mean(dim=1), vid.std(dim=1)), dim=-1))   # x-vector
+        #aud_id = self.spk_id(torch.cat((aud.mean(dim=1), aud.std(dim=1)), dim=-1))   # x-vector
+        vid_id = self.spk_id(torch.cat((vid.mean(dim=1), vid.max(dim=1)[0]), dim=-1))
+        aud_id = self.spk_id(torch.cat((aud.mean(dim=1), aud.max(dim=1)[0]), dim=-1))  
+        #id_logits = self.spk_cls(vid_id) + self.spk_cls(aud_id)
+        vid_id_logits, aud_id_logits = self.spk_cls(vid_id), self.spk_cls(aud_id)
 
         '''
         inp_feat = self.av_fusion(aud, vid)
         enc_src = self.cfm(inp_feat, src_lens)
         '''
-        #inp_feat = torch.cat((aud+self.am_embed, vid+self.vm_embed), dim=1)
-        #enc_src = self.cfm(inp_feat, src_lens+vid_lens)[:, :aud.shape[1]]
+        inp_feat = torch.cat((aud+self.am_embed, vid+self.vm_embed), dim=1)
+        enc_src = self.cfm(inp_feat, src_lens+vid_lens)[:, :aud.shape[1]]
         #orth_loss = diff_loss(aud_id.unsqueeze(1).expand_as(enc_src).detach(), enc_src)  # 1.63
-        #orth_loss = diff_loss(aud_id.unsqueeze(1).expand_as(enc_src).detach(), enc_src) + diff_loss(vid_id.unsqueeze(1).expand_as(enc_src).detach(), enc_src)
+        orth_loss = diff_loss(aud_id.unsqueeze(1).expand_as(enc_src).detach(), enc_src) + diff_loss(vid_id.unsqueeze(1).expand_as(enc_src).detach(), enc_src)
         
-        enc_v, enc_a = self.cfm_v(vid, vid_lens), self.cfm_a(aud, aud_lens)
-        enc_vc, enc_ac = self.cfm_c(vid, vid_lens), self.cfm_c(aud, aud_lens)
-        
-        #vid_id = self.spk_vid(torch.mean(enc_v, dim=1))
-        vid_mean, vid_std = torch.std_mean(enc_v, dim=1)
-        vid_id = self.spk_vid(torch.cat((vid_mean, vid_std), dim=-1))   # x-vector
-        aud_mean, aud_std = torch.std_mean(enc_a, dim=1)
-        aud_id = self.spk_aid(torch.cat((aud_mean, aud_std), dim=-1))   # x-vector
-        id_logits = (self.spk_cls(vid_id) + self.spk_cls(aud_id)) / 2.
-        
-        # 说话人无关
-        orth_loss = ranking_loss(aud_id.unsqueeze(1), enc_ac, vid_id.unsqueeze(1), enc_vc)
-        #orth_loss = diff_loss(aud_id.unsqueeze(1).expand_as(enc_ac), enc_ac) + diff_loss(vid_id.unsqueeze(1).expand_as(enc_vc), enc_vc) + F.mse_loss(aud_id, vid_id)
-        #orth_loss = diff_loss(aud_id.unsqueeze(1).expand_as(enc_ac), enc_ac) + diff_loss(vid_id.unsqueeze(1).expand_as(enc_vc), enc_vc) + diff_loss(aud_id.unsqueeze(1).expand_as(enc_a), enc_a) + diff_loss(vid_id.unsqueeze(1).expand_as(enc_v), enc_v) + F.smooth_l1_loss(aud_id, vid_id)
-        #orth_loss = diff_loss(aud_id.unsqueeze(1).expand_as(enc_ac).detach(), enc_ac) + diff_loss(vid_id.unsqueeze(1).expand_as(enc_vc).detach(), enc_vc) + diff_loss(aud_id.unsqueeze(1).expand_as(enc_a).detach(), enc_a) + diff_loss(vid_id.unsqueeze(1).expand_as(enc_v).detach(), enc_v) + cmd(aud_id, vid_id)
-        #orth_loss = diff_loss(aud_id.unsqueeze(1).expand_as(enc_ac).detach(), enc_ac) + diff_loss(vid_id.unsqueeze(1).expand_as(enc_vc).detach(), enc_vc) + diff_loss(aud_id.unsqueeze(1).expand_as(enc_a).detach(), enc_a) + diff_loss(vid_id.unsqueeze(1).expand_as(enc_v).detach(), enc_v) + CORAL(aud_id, vid_id)
-        #orth_loss = diff_loss(aud_id.unsqueeze(1).expand_as(enc_ac).detach(), enc_ac) + diff_loss(vid_id.unsqueeze(1).expand_as(enc_vc).detach(), enc_vc) + diff_loss(aud_id.unsqueeze(1).expand_as(enc_a).detach(), enc_a) + diff_loss(vid_id.unsqueeze(1).expand_as(enc_v).detach(), enc_v) + mmd(aud_id, vid_id)
-       
-        # 模态无关
-        #orth_loss = orth_loss + diff_loss(enc_v, enc_vc) + diff_loss(enc_a, enc_ac) + diff_loss(enc_v.mean(1), enc_a.mean(1)) + F.mse_loss(enc_vc.mean(1), enc_ac.mean(1))
-        #orth_loss = orth_loss + diff_loss(enc_v, enc_vc) + diff_loss(enc_a, enc_ac) + diff_loss(enc_v.mean(1), enc_a.mean(1)) + cmd(enc_vc.mean(1), enc_ac.mean(1))
-        #orth_loss = orth_loss + diff_loss(enc_v, enc_vc) + diff_loss(enc_a, enc_ac) + diff_loss(enc_v.mean(1), enc_a.mean(1)) + CORAL(enc_vc.mean(1), enc_ac.mean(1))
-        #orth_loss = orth_loss + diff_loss(enc_v, enc_vc) + diff_loss(enc_a, enc_ac) + diff_loss(enc_v.mean(1), enc_a.mean(1)) + mmd(enc_vc.mean(1), enc_ac.mean(1))
-        #orth_loss = orth_loss + diff_loss(enc_v, enc_vc) + diff_loss(enc_a, enc_ac) + diff_loss(enc_v.mean(1), enc_a.mean(1)) + F.mse_loss(enc_vc.mean(1), enc_ac.mean(1))
-        orth_loss = orth_loss + ranking_loss(enc_vc.mean(1, keepdims=True), enc_v, enc_ac.mean(1, keepdims=True), enc_a) + diff_loss(enc_v.mean(1), enc_a.mean(1))
-
-        # 重构
-        #recon_a = self.recon_a(torch.cat((enc_a, enc_ac, aud_id.unsqueeze(1).expand_as(enc_a)), dim=-1))
-        #recon_v = self.recon_v(torch.cat((enc_v, enc_vc, vid_id.unsqueeze(1).expand_as(enc_v)), dim=-1))
-        # 重构：交换语义 (存在音视序列长度不一致问题)
-        #recon_a = self.recon_a(torch.cat((enc_a, enc_vc, aud_id.unsqueeze(1).expand_as(enc_a)), dim=-1))
-        #recon_v = self.recon_v(torch.cat((enc_v, enc_ac, vid_id.unsqueeze(1).expand_as(enc_v)), dim=-1))
-        # 重构：交换身份信息
-        #recon_a = self.recon_a(torch.cat((enc_a, enc_ac, vid_id.unsqueeze(1).expand_as(enc_a)), dim=-1))
-        #recon_v = self.recon_v(torch.cat((enc_v, enc_vc, aud_id.unsqueeze(1).expand_as(enc_v)), dim=-1))
-        #orth_loss = orth_loss + F.mse_loss(aud, recon_a) + F.mse_loss(vid, recon_v)
-        #orth_loss = orth_loss + F.smooth_l1_loss(aud, recon_a) + F.smooth_l1_loss(vid, recon_v)
-
-        # share-private discriminative
-        #domain_pred = torch.cat((self.sp_disc(enc_a.mean(dim=1)), self.sp_disc(enc_v.mean(dim=1)), self.sp_disc(enc_ac.mean(dim=1)), self.sp_disc(enc_vc.mean(dim=1))), dim=0)
-        #domain_true = torch.cat((torch.LongTensor([0]*enc_a.size(0)), torch.LongTensor([1]*enc_v.size(0)), torch.LongTensor([2]*enc_ac.size(0)), torch.LongTensor([2]*enc_vc.size(0))), dim=0).to(domain_pred.device) 
-        #disc_loss = F.cross_entropy(domain_pred, domain_true)
-        #orth_loss = orth_loss + disc_loss
-
-        #enc_src = self.av_fusion(enc_ac, enc_vc, self.av_mlp)
-        # visual-dominated
-        enc_src = self.av_trans(enc_ac.transpose(0, 1), enc_vc.transpose(0, 1), enc_vc.transpose(0, 1)).transpose(0, 1)
-        # audio-dominated
-        #enc_src = self.av_trans(enc_vc.transpose(0, 1), enc_ac.transpose(0, 1), enc_ac.transpose(0, 1)).transpose(0, 1)
-
         ctc_out = self.fc(enc_src)
         dec_out = self.trans_dec(tgt, enc_src, src_lens, tgt_lens)
         #out2 = self.fc(F.normalize(seq_feat1, dim=-1)) + self.fc(F.normalize(seq_feat2, dim=-1))
-        return ctc_out, dec_out, id_logits, orth_loss
+        #return ctc_out, dec_out, id_logits, orth_loss
+        return ctc_out, dec_out, vid_id_logits, aud_id_logits, orth_loss
 
     def beam_search_decode(self, vid, aud, vid_lens, aud_lens, bos_id, eos_id, max_dec_len=80, pad_id=0):
         with torch.no_grad():
-            src_lens = aud_lens
-            # src_lens = vid_lens
+            b, t = vid.size()[:2]
+            lens = aud_lens // self.scale   # time downsampling
             vid = self.visual_frontend(vid)
             aud = self.audio_frontend(aud)
-
             '''
             inp_feat = self.av_fusion(aud, vid)
             enc_src = self.cfm(inp_feat, lens)
             '''
-            #inp_feat = torch.cat((aud+self.am_embed, vid+self.vm_embed), dim=1)
-            #enc_src = self.cfm(inp_feat, lens+vid_lens)[:, :aud.shape[1]]
-            enc_vc, enc_ac = self.cfm_c(vid, vid_lens), self.cfm_c(aud, aud_lens)
-            #enc_src = self.av_fusion(enc_ac, enc_vc, self.av_mlp)
-            # visual-dominated
-            enc_src = self.av_trans(enc_ac.transpose(0, 1), enc_vc.transpose(0, 1), enc_vc.transpose(0, 1)).transpose(0, 1)
-            # audio-dominated
-            #enc_src = self.av_trans(enc_vc.transpose(0, 1), enc_ac.transpose(0, 1), enc_ac.transpose(0, 1)).transpose(0, 1)
-
-            #res = beam_decode(self.trans_dec, enc_src, src_mask, bos_id, eos_id, max_output_length=max_dec_len, beam_size=10)
-            res = beam_decode(self.trans_dec, enc_src, src_lens, bos_id, eos_id, max_output_length=max_dec_len, beam_size=10)
+            inp_feat = torch.cat((aud+self.am_embed, vid+self.vm_embed), dim=1)
+            enc_src = self.cfm(inp_feat, lens+vid_lens)[:, :aud.shape[1]]
+        
+            #res = beam_decode(self.trans_dec, enc_src, src_mask, bos_id, eos_id, max_output_length=max_dec_len, beam_size=6)
+            res = beam_decode(self.trans_dec, enc_src, lens, bos_id, eos_id, max_output_length=max_dec_len, beam_size=6)
         return res.detach().cpu()
 
     def ctc_greedy_decode(self, vids, lens=None):
         with torch.no_grad():
+            b, t = vids.size()[:2]
             vid_feat = self.visual_frontend(vids)
             seq_feat = self.cfm(vid_feat, lens)
             logits = self.fc(seq_feat)  # (B, T, V)
@@ -444,6 +321,7 @@ class CTCLipModel(nn.Module):
     def ctc_beam_decode(self, vids, lens=None):
         res = []
         with torch.no_grad():
+            b, t = vids.size()[:2]
             vid_feat = self.visual_frontend(vids)
             seq_feat = self.cfm(vid_feat, lens)
             logits = self.fc(seq_feat)  # (B, T, V)
@@ -497,6 +375,8 @@ class CTCLipModel(nn.Module):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
 
+
+
 class SpeakerIdentity(nn.Module):
     def __init__(self):
         super(SpeakerIdentity, self).__init__()
@@ -541,12 +421,10 @@ class SpeakerIdentity(nn.Module):
         return x, seq_feat   # (b, d)
 
 
-# 适用于ASR
+# 适用于ASR，不适用VSR
 class SelfAttentivePooling(nn.Module):
-    def __init__(self, hid_size, attn_size=None):
+    def __init__(self, hid_size, attn_size):
         super(SelfAttentivePooling, self).__init__()
-        if attn_size is None:
-            attn_size = hid_size // 2
         self.mlp = nn.Sequential(
                 nn.Linear(hid_size, attn_size),
                 nn.ReLU(True),
@@ -560,6 +438,7 @@ class SelfAttentivePooling(nn.Module):
         return pooled_output
 
 
+
 class Transpose(nn.Module):
     def __init__(self, dim0, dim1):
         super(Transpose, self).__init__()
@@ -568,6 +447,7 @@ class Transpose(nn.Module):
 
     def forward(self, x):
         return torch.transpose(x, self.dim0, self.dim1)
+
 
 
 class SpeakerIdentity2D(nn.Module):
@@ -606,28 +486,29 @@ class SpeakerIdentity2D(nn.Module):
         return x, seq_feat, self.spk_cls(seq_feat)  # (b, t, d)  (b, d)
 
 
+
 class DRLModel(nn.Module):
     def __init__(self, vocab_size, num_spk):
         super(DRLModel, self).__init__()
-        self.avsr = CTCLipModel(vocab_size, num_spk)
+        self.vsr = CTCLipModel(vocab_size)
         #self.spk = SpeakerIdentity()
         self.spk = SpeakerIdentity2D(num_spk)
         self.mi_net = CLUBSample_reshape(512, 512, 512)
         self.tmp = 1.
 
     def forward(self, vids, auds, tgts, spk_ids, vid_lens, aud_lens, tgt_lens):   # (B, T, C, H, W)
-        aud_lens = (aud_lens + self.avsr.scale - 1) // self.avsr.scale    # time subsampling after CNN striding
-        ctc_logits, dec_logits, spk_logits, drl_loss = self.avsr(vids, auds, tgts[:, :-1], vid_lens, aud_lens, tgt_lens)[:4]
-        spk_loss = F.cross_entropy(spk_logits, spk_ids, ignore_index=-1)
+        #ctc_logits, dec_logits, spk_logits, orth_loss = self.vsr(vids, auds, tgts[:, :-1], vid_lens, aud_lens, tgt_lens)[:4]
+        #spk_loss = F.cross_entropy(spk_logits, spk_ids)
+        ctc_logits, dec_logits, spk_vid_logits, spk_aud_logits, orth_loss = self.vsr(vids, auds, tgts[:, :-1], vid_lens, aud_lens, tgt_lens)[:5]
+        spk_loss = F.cross_entropy(spk_vid_logits, spk_ids) + F.cross_entropy(spk_aud_logits, spk_ids)
 
         ctc_log_probs = ctc_logits.transpose(0, 1).log_softmax(dim=-1)  # (T, B, V)
-        ctc_loss = F.ctc_loss(ctc_log_probs, tgts[:, 1:], aud_lens.reshape(-1), tgt_lens.reshape(-1), zero_infinity=True)  # audio-as-query
-        #ctc_loss = F.ctc_loss(ctc_log_probs, tgts[:, 1:], vid_lens.reshape(-1), tgt_lens.reshape(-1), zero_infinity=True) # video-as-query
+        ctc_loss = F.ctc_loss(ctc_log_probs, tgts[:, 1:], aud_lens.reshape(-1) // 4, tgt_lens.reshape(-1), zero_infinity=True)  # time downsampling 
         attn_loss = F.cross_entropy(dec_logits.transpose(-1, -2).contiguous(), tgts[:, 1:].long(), ignore_index=0)
         vsr_loss = 0.9*attn_loss + 0.1*ctc_loss
-        return {'vsr': vsr_loss, 'spk': spk_loss, 'drl': drl_loss}
+        return vsr_loss + 0.5*spk_loss + 0.5*orth_loss
 
-    def load_pretrain_bert(self, path, text):
+    def load_pretrain_bert(self, path):
         from transformers import BertTokenizer, BertModel
         self.tokenizer = BertTokenizer.from_pretrained(path)
         self.bert_model = BertModel.from_pretrained(path)
@@ -666,6 +547,7 @@ class DRLModel(nn.Module):
         seq_loss = 0.5 * seq_loss1 + 0.5 * seq_loss2
         return frame_loss + seq_loss
 
+    
     '''
     def calc_triplet_loss(self, vids):
         vids = torch.flatten(vids, 0, 1)
@@ -720,9 +602,9 @@ class DRLModel(nn.Module):
         attn_loss = F.cross_entropy(dec_logits.transpose(-1, -2).contiguous(), tgts[:, 1:].long(), ignore_index=0)
         vsr_loss = 0.9*attn_loss + 0.1*ctc_loss
         #c1, c2 = cont_feat.chunk(2, dim=0)  # 对应s1, s2  (N, T, D)
-        #orth_loss = diff_loss(s1.unsqueeze(1).detach(), c1) + diff_loss(s2.unsqueeze(1).detach(), c2)    # (N, D)  (N, T, D)
-        orth_loss = diff_loss(spk_feat.unsqueeze(1).expand_as(cont_feat).detach(), cont_feat)
-        return vsr_loss + spk_loss + orth_loss
+        #diff_loss = diff_loss(s1.unsqueeze(1).detach(), c1) + diff_loss(s2.unsqueeze(1).detach(), c2)    # (N, D)  (N, T, D)
+        diff_loss = diff_loss(spk_feat.unsqueeze(1).expand_as(cont_feat).detach(), cont_feat) 
+        return vsr_loss + spk_loss + diff_loss
 
     def calc_orth_loss2(self, vids, tgts, spk_ids, xlens, ylens, opt_mi):
         '''
@@ -768,6 +650,7 @@ class DRLModel(nn.Module):
         mi_loss = self.mi_net.mi_est(spk_feat.unsqueeze(1).expand_as(cont_feat), cont_feat)
         return vsr_loss + 0.5 * spk_loss + 0.01 * mi_loss
 
+
     def calc_drl_loss(self, vids, tgts, xlens, ylens):
         vids = torch.flatten(vids, 0, 1)
         tgts = torch.flatten(tgts, 0, 1)
@@ -805,8 +688,10 @@ class DRLModel(nn.Module):
         vsr_loss = F.ctc_loss(log_probs, tgts, xlens.reshape(-1), ylens.reshape(-1), zero_infinity=True)
         ## for drl
         c1, c2 = cont_feat.chunk(2, dim=0)  # 对应s1, s2   (N, T, D)
-        orth_loss = diff_loss(s1.unsqueeze(1), c1) + diff_loss(s2.unsqueeze(1), c2)
-        return vsr_loss + spk_loss + orth_loss
+        diff_loss = diff_loss(s1.unsqueeze(1), c1) + diff_loss(s2.unsqueeze(1), c2) 
+        return vsr_loss + spk_loss + diff_loss
+
+
 
     # 低效！
     def calc_cl_loss(self, vids, tgts, xlens, ylens):
@@ -833,8 +718,10 @@ class DRLModel(nn.Module):
         return vsr_loss + drl_loss * 0.5
 
     def greedy_decode(self, vids, lens=None):
-        return self.avsr.ctc_greedy_decode(vids, lens)
+        return self.vsr.ctc_greedy_decode(vids, lens)
 
     def beam_decode(self, vid, aud, vid_lens, aud_lens, bos_id, eos_id, max_dec_len=50, pad_id=0):
-        aud_lens = (aud_lens + self.avsr.scale - 1) // self.avsr.scale    # time subsampling after CNN striding
-        return self.avsr.beam_search_decode(vid, aud, vid_lens, aud_lens, bos_id, eos_id, max_dec_len, pad_id)
+        return self.vsr.beam_search_decode(vid, aud, vid_lens, aud_lens, bos_id, eos_id, max_dec_len, pad_id)
+
+
+

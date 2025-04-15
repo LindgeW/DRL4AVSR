@@ -1,9 +1,8 @@
 import numpy as np
 
-
-def horizontal_flip(video_imgs):
+def horizontal_flip(vid_imgs):
     # (T, C, H, W)
-    return np.flip(video_imgs, -1).copy()
+    return np.flip(vid_imgs, -1).copy()
 
 
 def vid_rand_crop(vid, crop_height, crop_width):
@@ -48,7 +47,6 @@ def vid_center_crop(vid, crop_height, crop_width):
     y = (height - crop_height) // 2
     #return vid[:, y:y + crop_height, x:x + crop_width]
     return vid[..., y:y + crop_height, x:x + crop_width]
-
 
 
 def spec_augment(mel_spec, freq_masking_para=5, time_masking_para=30, freq_mask_num=1, time_mask_num=1, time_first=False):

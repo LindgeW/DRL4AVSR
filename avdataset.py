@@ -2,6 +2,7 @@ import os
 import cv2
 import numpy as np
 import torch
+import string
 from torch.utils.data import Dataset, DataLoader, Sampler
 import json
 import librosa
@@ -9,7 +10,6 @@ from data_augment import *
 from torch.nn.utils.rnn import pad_sequence
 
 PAD = '<pad>'
-SPACE = ' '
 BOS = '<bos>'
 EOS = '<eos>'
 
@@ -142,7 +142,8 @@ class GRIDDataset(Dataset):
             self.dataset = data
         print(len(self.dataset))
         self.phase = phase
-        self.vocab = [PAD] + list(' ' + string.ascii_uppercase)    # 28
+        self.vocab = [PAD] + [' ', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
+                                  'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']    # 28
         self.max_vid_len = 75
         self.max_txt_len = 50
 
@@ -208,7 +209,7 @@ class Speaker(object):
     def __init__(self, data):
         # GRID\LIP_160x80\lip\s1\bbaf4p
         self.data = data
-        self.vocab = [PAD] + list(' ' + string.ascii_uppercase)   # 28
+        self.vocab = [PAD] + [' ', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']   # 28
         self.max_vid_len = 75
         self.max_txt_len = 50
 
@@ -305,7 +306,7 @@ class NoiseDataset(object):
 
         if np.random.rand() < 0.5:
             if len(self.noise) < len(signal):
-                noise = np.tile(self.noise, len(signal) // len(self.noise) + 1)
+                noise = np.tile(self.noise.copy(), len(signal) // len(self.noise) + 1)
             else:
                 noise = self.noise.copy()
             # Randomly Select Noise Clip
@@ -352,7 +353,7 @@ class GRIDDataset(Dataset):
         self.sample_size = sample_size  # 每个speaker采的样本数
         self.root_path = root_path
         self.phase = phase
-        #self.vocab = [PAD] + list(' ' + string.ascii_uppercase)  # 28
+        #self.vocab = [PAD] + [' ', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']  # 28
         with open('word_vocab.txt', 'r', encoding='utf-8') as fin:
             vocab = [line.strip() for line in fin if line.strip() != '']
         #self.vocab = [PAD] + vocab  # 52
@@ -401,7 +402,7 @@ class GRIDDataset(Dataset):
             y = librosa.resample(y, orig_sr=sr0, target_sr=sr)
 
         # 以0.25的概率随机叠加噪声波形
-        if self.phase != 'test' and np.random.rand() < 0.25:
+        if self.phase == 'train' and np.random.rand() < 0.25:
             y = self.noise_generator.training_noisy_signal(y)
         else:
             y = normalize(y)
@@ -425,7 +426,7 @@ class GRIDDataset(Dataset):
         return np.asarray([self.vocab.index(BOS)] + [self.vocab.index(w.upper()) for w in txt] + [self.vocab.index(EOS)])
 
     def data_augment(self, vid, aud):
-        if self.phase != 'test' and np.random.rand() < 0.5:
+        if self.phase == 'train' and np.random.rand() < 0.5:
             vid = horizontal_flip(vid)
             #aud = spec_augment(aud, time_first=True)
             return vid, aud
@@ -563,7 +564,7 @@ class CMLRDataset(Dataset):
             y = librosa.resample(y, orig_sr=sr0, target_sr=sr)
 
         # 以0.25的概率随机叠加噪声波形
-        if self.phase != 'test' and np.random.rand() < 0.25:
+        if self.phase == 'train' and np.random.rand() < 0.25:
             y = self.noise_generator.training_noisy_signal(y)
         else:
             y = normalize(y)
@@ -587,7 +588,7 @@ class CMLRDataset(Dataset):
         return np.asarray(list(map(self.vocab.index, [BOS]+list(txt)+[EOS])))
 
     def data_augment(self, vid, aud):
-        if self.phase != 'test' and np.random.rand() < 0.5:
+        if self.phase == 'train' and np.random.rand() < 0.5:
             vid = horizontal_flip(vid)
             #aud = spec_augment(aud, time_first=True)
             return vid, aud
@@ -675,67 +676,23 @@ class CMLRDataset(Dataset):
     #     return torch.utils.data.dataloader.default_collate(batch)
 
 
-def pad_seqs(samples, max_len=None, pad_val=0.):
-    if max_len is None:
-        lens = [len(s) for s in samples]
-    else:
-        lens = [min(len(s), max_len) for s in samples]
-    max_len = max(lens)
-    padded_batch = samples[0].new_full((len(samples), max_len, ) + samples[0].shape[1:], pad_val)
-    for i, s in enumerate(samples):
-        if len(s) < max_len:
-            padded_batch[i][:len(s)] = s
-        else:
-            padded_batch[i] = s[:max_len]
-    return padded_batch, lens
 
-
-def pad_seqs2(samples, max_len=None, pad_val=0.):
-    if max_len is None:
-        lens = [len(s) for s in samples]
-    else:
-        lens = [min(len(s), max_len) for s in samples]
-    max_len = max(lens)
-    padded_batch = []
-    for seq in samples:
-        if len(seq) < max_len:
-            padding = seq.new_full((max_len-len(seq), ) + seq.shape[1:], pad_val)
-            padded_seq = torch.cat((seq, padding), dim=0)
-        else:
-            padded_seq = seq[:max_len]
-        padded_batch.append(padded_seq)
-    return torch.stack(padded_batch), lens
-
-
-def pad_seqs3(samples, max_len=None, pad_val=0.):
-    if max_len is None:
-        lens = [len(s) for s in samples]
-    else:
-        lens = [min(len(s), max_len) for s in samples]
-    max_len = max(lens)
-    padded_batch = pad_sequence(samples, batch_first=True, padding_value=pad_val)  # (B, L_max, ...)
-    return padded_batch[:, :min(max_len, padded_batch.shape[1])], lens
-
-
-
-
-class LRS3Dataset(Dataset):   # 说话人数量多 
+class LRS3Dataset(Dataset):   # 说话人数量多，但每个说话人的样本少
     # 类变量
     MAX_VID_LEN = 155
-    MAX_AUD_LEN = 620
-    #MAX_AUD_LEN = 155   # avhubert
+    #MAX_AUD_LEN = 620
+    MAX_AUD_LEN = 155   # avhubert
     MAX_TXT_LEN = 150
 
-    def __init__(self, root_path, file_list, phase='train', setting='unseen', max_frame=None):
+    def __init__(self, root_path, file_list, phase='train', setting='unseen'):
         self.root_path = root_path
         self.phase = phase
         self.data = []
         self.spks = list(range(4004))
         with open(file_list, 'r', encoding='utf-8') as f:
-            for line in f:  # 1 test/stngBN4hp14/00001.npy 120
-                spk_id, fn, frame_num = line.strip().split(' ')
-                if max_frame is None or int(frame_num) <= max_frame:
-                	self.data.append((int(spk_id), fn))
+            for line in f:  # 1 test/stngBN4hp14/00001.npy
+                spk_id, fn = line.strip().split(' ')
+                self.data.append((int(spk_id), fn))
         self.vocab = [PAD] + list(" " + string.ascii_lowercase + string.digits + "'") + [EOS, BOS]
         print(len(self.data), len(self.spks), len(self.vocab))
 
@@ -767,7 +724,7 @@ class LRS3Dataset(Dataset):   # 说话人数量多
                 feats = np.concatenate([feats, res], axis=0)
             feats = feats.reshape((-1, stack_order, feat_dim)).reshape(-1, stack_order*feat_dim)
             return feats
-
+        
         # y, sr = librosa.load(fn, sr=sr)  # 16kHz
         y, sr0 = librosa.load(fn, sr=None)
         if sr0 != sr:
@@ -783,13 +740,13 @@ class LRS3Dataset(Dataset):   # 说话人数量多
         #melspec = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=512, win_length=320, hop_length=160, n_mels=80)  # 20ms win / 10ms hop for lrs3
         #melspec = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=512, win_length=400, hop_length=160, n_mels=80)  # 25ms win / 10ms hop for lrs3
         #melspec = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=640, hop_length=160, n_mels=80)  # 40ms win / 10ms hop for lrs3
-        melspec = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=512, win_length=400, hop_length=160, n_mels=80)  # 25ms win / 10ms hop for lrs3
-        #melspec = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=512, win_length=400, hop_length=160, n_mels=26)  # 25ms win / 10ms hop for avhubert
+        melspec = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=512, win_length=400, hop_length=160, n_mels=26)  # 25ms win / 10ms hop for avhubert
         logmelspec = librosa.power_to_db(melspec, ref=np.max)
         #return logmelspec.T  # (T, n_mels)
         log_mel = logmelspec.T   # (T, n_mels)
-        #log_mel = stacker(log_mel, 4)  # only for avhubert: 26 * 4
+        log_mel = stacker(log_mel, 4)  # only for avhubert: 26 * 4
         norm_log_mel = np.nan_to_num((log_mel - log_mel.mean(0, keepdims=True)) / (log_mel.std(0, keepdims=True)+1e-8))  # z-norm along time
+        #norm_log_mel = np.nan_to_num((log_mel - log_mel.mean(1, keepdims=True)) / (log_mel.std(1, keepdims=True)+1e-8))  # z-norm along freq
         return norm_log_mel
 
     def load_txt(self, fn):
@@ -834,11 +791,11 @@ class LRS3Dataset(Dataset):   # 说话人数量多
         vid = self.load_video(vid_path)
         aud = self.load_audio(aud_path)
         # 对齐帧长
-        #diff = len(aud) - len(vid)
-        #if diff < 0:
-        #    aud = np.concatenate([aud, np.zeros((-diff, aud.shape[-1]), dtype=aud.dtype)])
-        #elif diff > 0:
-        #    aud = aud[:-diff]
+        diff = len(aud) - len(vid)
+        if diff < 0:
+            aud = np.concatenate([aud, np.zeros((-diff, aud.shape[-1]), dtype=aud.dtype)])
+        elif diff > 0:
+            aud = aud[:-diff]
 
         txt = self.load_txt(align_path)
         # data augmentation
@@ -895,7 +852,7 @@ class LRS3Dataset(Dataset):   # 说话人数量多
     # @classmethod
     # def collate_pad(cls, batch):
     #     return torch.utils.data.dataloader.default_collate(batch)
-
+    
 
 def pad_seqs(samples, max_len=None, pad_val=0.):
     if max_len is None:

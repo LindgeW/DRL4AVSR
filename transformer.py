@@ -169,6 +169,7 @@ class MultiheadAttention(nn.Module):
         return F.linear(input, weight, bias)
 
 
+
 class TransformerEncoder(nn.Module):
     """
     Transformer encoder consisting of *args.encoder_layers* layers. Each layer
@@ -176,11 +177,11 @@ class TransformerEncoder(nn.Module):
     Args:
         embed_tokens (torch.nn.Embedding): input embedding
         num_heads (int): number of heads
-        num_layers (int): number of layers
+        layers (int): number of layers
         dropout (float): dropout
         attn_mask (bool): whether to apply mask on the attention weights
     """
-    def __init__(self, embed_dim, num_heads, num_layers, dropout=0.1, attn_mask=False):
+    def __init__(self, embed_dim, num_heads, layers, dropout=0.1, attn_mask=False):
         super().__init__()
         self.dropout = dropout
         self.embed_dim = embed_dim
@@ -190,7 +191,8 @@ class TransformerEncoder(nn.Module):
         self.layers = nn.ModuleList([TransformerEncoderLayer(embed_dim,
                                     num_heads=num_heads,
                                     dropout=dropout,
-                                    attn_mask=attn_mask) for _ in range(num_layers)])
+                                    attn_mask=attn_mask)
+            for _ in range(layers)])
 
         self.normalize = False
         if self.normalize:
@@ -229,6 +231,7 @@ class TransformerEncoder(nn.Module):
         if self.normalize:
             x = self.layer_norm(x)
         return x
+
 
 
 class TransformerEncoderLayer(nn.Module):

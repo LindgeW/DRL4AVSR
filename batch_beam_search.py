@@ -237,12 +237,14 @@ def beam_decode(
         #src_mask = src_mask.index_select(0, select_indices)
         src_lens = src_lens.index_select(0, select_indices)
 
-    # final_outputs = [[rr.detach().cpu() for rr in br] for br in results["predictions"]]
-    # final_scores = [[rr.detach().cpu().item() for rr in br] for br in results["scores"]]
-    # return final_outputs, final_scores
+    if n_best == 1:
+        # top-1 best
+        final_outputs = []
+        for br in results["predictions"]:
+            final_outputs.extend(br)
+        return pad_sequence(final_outputs, batch_first=True, padding_value=eos_index)
 
-    final_outputs = []
-    for br in results["predictions"]:
-        final_outputs.extend(br)
-    return pad_sequence(final_outputs, batch_first=True, padding_value=eos_index)
-
+    # B x n_best x dec_len
+    final_outputs = [[rr.detach().cpu() for rr in br] for br in results["predictions"]]
+    final_scores = [[rr.detach().cpu().item() for rr in br] for br in results["scores"]]
+    return final_outputs, final_scores

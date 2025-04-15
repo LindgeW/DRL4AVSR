@@ -17,7 +17,7 @@ def ensemble(ckpt_path, model_path='model_avg_10.pt'):
             print(path)
             N += 1
             # load model state_dict
-            states = torch.load(path.strip(), map_location=lambda storage, loc: storage)['model']
+            states = torch.load(path.strip(), map_location=lambda storage, loc: storage, weights_only=True)['model']
             if avg is None:
                 avg = states
             else:
@@ -34,4 +34,8 @@ def ensemble(ckpt_path, model_path='model_avg_10.pt'):
     print(f'{model_path} saved !!')
 
 
-ensemble('last_10_pt.txt', 'model_avg_10.pt')
+#ensemble('last_10_pt.txt', 'model_avg_10.pt')
+#ensemble('vsr_pt.txt', 'vsr_avg_10.pt')
+ensemble('asr_pt.txt', 'asr_avg_10.pt2')
+#ensemble('last_10_baseline.txt', 'model_avg_baseline2.pt')
+#ensemble('last_10_baseline.txt', 'model_avg_baseline3.pt')
