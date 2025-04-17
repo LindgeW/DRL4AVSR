@@ -197,6 +197,72 @@ class TransDecoder(nn.Module):
         return self.fc(dec_out)
 
 
+## 2DCNN for audio front-end
+class AudioFrontend(nn.Module):
+    def __init__(self, freq_dim):
+        super(AudioFrontend, self).__init__()
+        # Conv2D 
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=128, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))  # (B, C, H, W)
+        self.bn1 = nn.BatchNorm2d(128)
+        self.proj = nn.Linear(128 * freq_dim//2, 512)
+
+    def forward(self, x):   # (B, F, T)
+        x = x.unsqueeze(1)  # (B, 1, F, T)
+        x = F.relu(self.bn1(self.conv1(x)))   # (B, 128, F//2, T//2)
+        x = x.permute(0, 3, 1, 2).contiguous()  # (B, T//2, 128, F//2)
+        x = torch.flatten(x, start_dim=2)   # (B, T//2, F//2 * 128)
+        x = self.proj(x)
+        return x
+
+
+class AudioFrontend2(nn.Module):
+    def __init__(self, freq_dim):
+        super(AudioFrontend2, self).__init__()
+        # Conv2D 
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=128, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))  # (B, C, H, W)
+        self.bn1 = nn.BatchNorm2d(128)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
+        self.bn2 = nn.BatchNorm2d(256)
+        self.relu2 = nn.ReLU(inplace=True)
+        # ResBlock2D 
+        self.resblock_conv1 = nn.Conv2d(in_channels=256, out_channels=256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        self.resblock_bn1 = nn.BatchNorm2d(256)
+        self.resblock_relu1 = nn.ReLU(inplace=True)
+        self.resblock_conv2 = nn.Conv2d(in_channels=256, out_channels=256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        self.resblock_bn2 = nn.BatchNorm2d(256)
+        self.resblock_relu2 = nn.ReLU(inplace=True)
+        
+        if freq_dim % 4 == 0:
+            in_dim = freq_dim // 4 * 256
+        else:
+            in_dim = (freq_dim // 4 + 1) * 256
+        self.fc = nn.Linear(in_dim, 512)
+
+    def forward(self, x):    # (B, T, F)
+        x = x.unsqueeze(1)  # (B, 1, T, F)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu1(x)   # (B, 128, T//2, F//2) 
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu2(x)   # (B, 256, T//4, F//4)
+
+        residual = x
+        x = self.resblock_conv1(x)
+        x = self.resblock_bn1(x)
+        x = self.resblock_relu1(x)
+        x = self.resblock_conv2(x)
+        x = self.resblock_bn2(x)
+        x += residual
+        x = self.resblock_relu2(x)    # (B, 256, T//4, F//4)
+
+        x = torch.flatten(x.transpose(1, 2), start_dim=2)   # (B, T//4, F//4 * 256)
+        x = self.fc(x)  
+        return x
+
+
+
 class CTCLipModel(nn.Module):
     def __init__(self, vocab_size, num_spk, se=False):
         super(CTCLipModel, self).__init__()
