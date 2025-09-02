@@ -13,6 +13,8 @@ Official Implementation of "Decoupled Representation Learning for Robust Audio-v
 - jiwer == 4.0.0
 - umap-learn == 0.5.8
 
+### Training / Inference
+`python avtrain.py <cuda_id> [grid|cmlr|lrs3]`
 
 ### Datasets
 - [GRID](https://spandh.dcs.shef.ac.uk/gridcorpus/)
