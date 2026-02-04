@@ -114,7 +114,7 @@ class ResNet(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=200, dropout=0.1):
+    def __init__(self, d_model, max_len=500, dropout=0.1):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(dropout)
         position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)  # (max_len, 1)
@@ -137,7 +137,7 @@ class TransDecoder(nn.Module):
                  n_heads=4,
                  ffn_ratio=4,
                  dropout=0.1,
-                 max_len=200):
+                 max_len=1000):
         super(TransDecoder, self).__init__()
         self.d_model = d_model
         self.tok_embedding = nn.Embedding(n_token, d_model)
@@ -159,7 +159,7 @@ class TransDecoder(nn.Module):
         if max_len is None:
             max_len = torch.max(lengths).item()
         ids = torch.arange(0, max_len).unsqueeze(0).expand(batch_size, -1).to(lengths.device)
-        mask = ids < lengths.unsqueeze(1).expand(-1, max_len)  # True or False
+        mask = ids >= lengths.unsqueeze(1).expand(-1, max_len)  # True for padding
         return mask
 
     def generate_mask_from_lens(self, seq_lengths, max_length=None):
@@ -186,8 +186,8 @@ class TransDecoder(nn.Module):
         tgt = self.tok_embedding(tgt) * (self.d_model ** 0.5)
         tgt = self.pos_enc(tgt)
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt.size(1)).to(tgt.device)   # 下三角 (下0上-inf)
-        # src_padding_mask = ~self.get_mask_from_lens(src_lens, src_enc.size(1))   # True for masking
-        # tgt_padding_mask = ~self.get_mask_from_lens(tgt_lens, tgt.size(1))   # True for masking
+        # src_padding_mask = self.get_mask_from_lens(src_lens, src_enc.size(1))   # True for masking
+        # tgt_padding_mask = self.get_mask_from_lens(tgt_lens, tgt.size(1))   # True for masking
         src_padding_mask = self.generate_mask_from_lens(src_lens, src_enc.size(1))   # float("-inf") for masking
         tgt_padding_mask = self.generate_mask_from_lens(tgt_lens, tgt.size(1))   # float("-inf") for masking
 
@@ -282,11 +282,11 @@ class CTCLipModel(nn.Module):
             nn.Conv1d(80, 128, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            #nn.Dropout(0.1),
             nn.Conv1d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),   # downsampling
             nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            #nn.Dropout(0.1),
             nn.Conv1d(256, 512, kernel_size=3, stride=2, padding=1, bias=False),   # downsampling
             nn.BatchNorm1d(512))
         self.scale = 4
